@@ -36,10 +36,11 @@ STICKERS = {
 # ========== DATABASE ==========
 conn = sqlite3.connect('rdx_premium.db', check_same_thread=False)
 c = conn.cursor()
+# FIXED: Added 'waiting' column
 c.execute('''CREATE TABLE IF NOT EXISTS users 
              (uid INTEGER PRIMARY KEY, auth INTEGER, total INTEGER, win INTEGER, loss INTEGER, 
               jackpot INTEGER, streak INTEGER, max_streak INTEGER, balance REAL, 
-              premium_level INTEGER, join_time REAL, last_pred_period INTEGER)''')
+              premium_level INTEGER, join_time REAL, last_pred_period INTEGER, waiting INTEGER DEFAULT 0)''')
 c.execute('''CREATE TABLE IF NOT EXISTS predictions 
              (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, period INTEGER, 
               pred_size TEXT, pred_num INTEGER, result TEXT, timestamp REAL)''')
@@ -203,14 +204,15 @@ def get_user(uid):
     c.execute("SELECT * FROM users WHERE uid=?", (uid,))
     result = c.fetchone()
     if not result:
-        c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", 
-                  (uid, 0, 0, 0, 0, 0, 0, 0, 500.0, 1, time.time(), 0))
+        c.execute("INSERT INTO users (uid, auth, total, win, loss, jackpot, streak, max_streak, balance, premium_level, join_time, last_pred_period, waiting) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", 
+                  (uid, 0, 0, 0, 0, 0, 0, 0, 500.0, 1, time.time(), 0, 0))
         conn.commit()
         return get_user(uid)
+    # Return as dictionary with proper keys including waiting
     return {"uid": result[0], "auth": result[1], "total": result[2], "win": result[3], 
             "loss": result[4], "jackpot": result[5], "streak": result[6], 
             "max_streak": result[7], "balance": result[8], "premium_level": result[9], 
-            "join_time": result[10], "last_pred_period": result[11]}
+            "join_time": result[10], "last_pred_period": result[11], "waiting": result[12] if len(result) > 12 else 0}
 
 def update_user(uid, **kwargs):
     for key, value in kwargs.items():
@@ -250,6 +252,9 @@ def get_hwid():
     except:
         return hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
 
+# FIXED: waiting_for_password dictionary to track users waiting for password
+waiting_for_password = {}
+
 @bot.message_handler(commands=['start'])
 def start_cmd(msg):
     uid = msg.chat.id
@@ -258,6 +263,10 @@ def start_cmd(msg):
         OWNER_ID = uid
     
     get_user(uid)
+    
+    # Clear any waiting state
+    waiting_for_password[uid] = False
+    update_user(uid, waiting=0)
     
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("💎 PREMIUM UNLOCK", callback_data="premium_unlock"))
@@ -281,17 +290,24 @@ def start_cmd(msg):
 @bot.callback_query_handler(func=lambda call: call.data == "premium_unlock")
 def premium_unlock(call):
     uid = call.message.chat.id
+    
+    # Set waiting state
+    waiting_for_password[uid] = True
+    update_user(uid, waiting=1)
+    
     bot.edit_message_text(
         f"💎 *PREMIUM AUTHENTICATION* 💎\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ *Enter your PREMIUM KEY*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💀 *VIP access only*",
+        f"💀 *VIP access only*\n\n"
+        f"*Type the password below:*",
         chat_id=uid,
         message_id=call.message.message_id,
         parse_mode="Markdown"
     )
-    update_user(uid, waiting=1)
+    
+    # Auto-clear waiting state after 60 seconds
     threading.Timer(60, lambda: clear_waiting(uid)).start()
 
 @bot.callback_query_handler(func=lambda call: call.data == "premium_owner")
@@ -299,13 +315,19 @@ def premium_owner(call):
     bot.answer_callback_query(call.id, f"OWNER: {OWNER_USERNAME}", show_alert=True)
 
 def clear_waiting(uid):
+    if uid in waiting_for_password:
+        waiting_for_password[uid] = False
     update_user(uid, waiting=0)
 
-@bot.message_handler(func=lambda msg: get_user(msg.chat.id).get("waiting", 0) == 1)
+# FIXED: This handler MUST be before any other message handlers
+@bot.message_handler(func=lambda msg: waiting_for_password.get(msg.chat.id, False) or get_user(msg.chat.id).get("waiting", 0) == 1)
 def premium_login(msg):
     uid = msg.chat.id
-    if msg.text.strip() == PASSWORD:
+    entered_password = msg.text.strip()
+    
+    if entered_password == PASSWORD:
         update_user(uid, auth=1, waiting=0)
+        waiting_for_password[uid] = False
         
         # SESSION START STICKER
         send_sticker(uid, "session_start")
@@ -326,7 +348,12 @@ def premium_login(msg):
         )
     else:
         update_user(uid, waiting=0)
-        bot.send_message(uid, "❌ *PREMIUM ACCESS DENIED*", parse_mode="Markdown")
+        waiting_for_password[uid] = False
+        bot.send_message(
+            uid, 
+            f"❌ *PREMIUM ACCESS DENIED*\n\nInvalid KEY: `{entered_password}`\n\nUse /start to try again.", 
+            parse_mode="Markdown"
+        )
 
 # ========== PREDICTION WITH STICKERS ==========
 pending_predictions = {}
@@ -640,7 +667,9 @@ def vip_upgrade(msg):
 def logout_cmd(msg):
     uid = msg.chat.id
     stop_auto(uid)
-    update_user(uid, auth=0)
+    update_user(uid, auth=0, waiting=0)
+    if uid in waiting_for_password:
+        waiting_for_password[uid] = False
     bot.send_message(uid, "🔫 *LOGOUT*", parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("/start")))
 
 # ========== OWNER COMMANDS ==========
